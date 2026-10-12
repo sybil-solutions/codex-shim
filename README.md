@@ -78,7 +78,7 @@ Recommended on macOS/Linux/WSL/Git Bash (installs the `codex-shim` entry
 point from `pyproject.toml`):
 
 ```bash
-git clone https://github.com/0xSero/codex-shim ~/codex-shim
+git clone https://github.com/sybil-solutions/codex-shim ~/codex-shim
 cd ~/codex-shim
 python3 -m pip install --user -e .
 ```
@@ -86,7 +86,7 @@ python3 -m pip install --user -e .
 Recommended on native Windows PowerShell/cmd:
 
 ```powershell
-git clone https://github.com/0xSero/codex-shim $HOME\codex-shim
+git clone https://github.com/sybil-solutions/codex-shim $HOME\codex-shim
 cd $HOME\codex-shim
 py -3.11 -m pip install --user -e .
 ```
@@ -108,7 +108,7 @@ Alternative on macOS/Linux/WSL/Git Bash (no install, run straight from the
 checkout):
 
 ```bash
-git clone https://github.com/0xSero/codex-shim ~/codex-shim
+git clone https://github.com/sybil-solutions/codex-shim ~/codex-shim
 cd ~/codex-shim
 python3 -m pip install --user aiohttp
 mkdir -p ~/.local/bin
