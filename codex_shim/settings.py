@@ -187,8 +187,32 @@ class ShimModel:
         return self.provider == "anthropic"
 
     @property
+    def is_responses_passthrough(self) -> bool:
+        if self.provider.lower() in {"responses", "openai-responses", "generic-responses-api"}:
+            return True
+        wire = str(_field(self.raw, "wire_api", "wireApi", "api", default="") or "").strip().lower()
+        if wire in {"responses", "openai-responses", "generic-responses-api"}:
+            return True
+        return bool(
+            _field(
+                self.raw,
+                "passthrough_responses",
+                "passthroughResponses",
+                "supports_responses_api",
+                "supportsResponsesApi",
+                default=False,
+            )
+        )
+
+    @property
     def is_openai_chat(self) -> bool:
-        return self.provider in {"openai", "generic-chat-completion-api"}
+        return self.provider in {
+            "openai",
+            "generic-chat-completion-api",
+            "responses",
+            "openai-responses",
+            "generic-responses-api",
+        }
 
 
 class ModelSettings:
