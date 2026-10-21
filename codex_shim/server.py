@@ -261,6 +261,8 @@ class ShimServer:
         if self._needs_image_gen(body) or self._needs_image_followup(body):
             return await self._chatgpt_passthrough(request, body, response_model_override=model)
         route = self._route(body)
+        if route.is_responses_passthrough:
+            return await self._post_openai_responses(request, route, body)
         if route.is_openai_chat:
             forwarded = responses_to_chat(body, route.model)
             return await self._post_openai_chat(request, route, forwarded, as_responses=True)
@@ -292,6 +294,8 @@ class ShimServer:
                 force_non_stream=True,
             )
         route = self._route(body)
+        if route.is_responses_passthrough:
+            return await self._post_openai_responses_compact(request, route, body)
         compact_body = _compact_request_body(body, route.model)
         if route.is_openai_chat:
             forwarded = responses_to_chat(compact_body, route.model)
@@ -747,6 +751,68 @@ class ShimServer:
             raise web.HTTPUnauthorized(text=_missing_api_key_message(route))
         return route
 
+    async def _post_openai_responses(
+        self, request: web.Request, route: ShimModel, body: dict[str, Any]
+    ) -> web.StreamResponse:
+        url = _join_url(route.base_url, "/responses")
+        forwarded = _sanitize_chatgpt_passthrough_body(body)
+        forwarded["model"] = route.model
+        if route.max_output_tokens is not None and "max_output_tokens" not in forwarded:
+            forwarded["max_output_tokens"] = route.max_output_tokens
+        headers = _openai_headers(route)
+        headers.setdefault("Accept", "text/event-stream" if forwarded.get("stream") else "application/json")
+        _dump_debug_request(route.slug, url, forwarded)
+        async with ClientSession(timeout=self.timeout) as session:
+            upstream = await session.post(url, json=forwarded, headers=headers)
+            if upstream.status >= 400:
+                return await _error_response(upstream, slug=route.slug)
+            if not forwarded.get("stream"):
+                payload = await upstream.json(content_type=None)
+                _rewrite_response_model(payload, route.slug, source_model=route.model)
+                intercepted = _maybe_intercept_web_search(payload) if isinstance(payload, dict) else None
+                return web.json_response(intercepted or payload)
+            response = _sse_response()
+            await response.prepare(request)
+            try:
+                async for line in _sse_lines(upstream):
+                    if line == "[DONE]":
+                        await _safe_write(response, b"data: [DONE]\n\n")
+                        break
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        await _safe_write(response, f"data: {line}\n\n".encode())
+                        continue
+                    _rewrite_response_model(payload, route.slug, source_model=route.model)
+                    await _write_sse(response, payload)
+            except ClientDisconnected:
+                pass
+            finally:
+                upstream.release()
+            try:
+                await response.write_eof()
+            except Exception:
+                pass
+            return response
+
+    async def _post_openai_responses_compact(
+        self, request: web.Request, route: ShimModel, body: dict[str, Any]
+    ) -> web.StreamResponse:
+        url = _join_url(route.base_url, "/responses/compact")
+        forwarded = _sanitize_chatgpt_passthrough_body(body)
+        forwarded["model"] = route.model
+        forwarded.pop("stream", None)
+        headers = _openai_headers(route)
+        headers.setdefault("Accept", "application/json")
+        _dump_debug_request(route.slug, url, forwarded)
+        async with ClientSession(timeout=self.timeout) as session:
+            upstream = await session.post(url, json=forwarded, headers=headers)
+            if upstream.status >= 400:
+                return await _error_response(upstream, slug=route.slug)
+            payload = await upstream.json(content_type=None)
+        _rewrite_response_model(payload, route.slug, source_model=route.model)
+        return web.json_response(payload)
+
     async def _post_openai_chat(
         self, request: web.Request, route: ShimModel, body: dict[str, Any], as_responses: bool
     ) -> web.StreamResponse:
@@ -979,17 +1045,22 @@ def _has_shim_encrypted_content(value: dict[str, Any]) -> bool:
     return isinstance(encrypted_content, str) and encrypted_content.startswith(SHIM_ENCRYPTED_CONTENT_PREFIX)
 
 
-def _rewrite_response_model(payload: Any, model: str | None) -> None:
+def _rewrite_response_model(
+    payload: Any, model: str | None, source_model: str | None = None
+) -> None:
     if not model:
         return
+    targets = {CHATGPT_MODEL_SLUG}
+    if source_model:
+        targets.add(source_model)
     if isinstance(payload, dict):
-        if payload.get("model") == CHATGPT_MODEL_SLUG:
+        if payload.get("model") in targets:
             payload["model"] = model
         for value in payload.values():
-            _rewrite_response_model(value, model)
+            _rewrite_response_model(value, model, source_model=source_model)
     elif isinstance(payload, list):
         for item in payload:
-            _rewrite_response_model(item, model)
+            _rewrite_response_model(item, model, source_model=source_model)
 
 
 class AnthropicMessagesStreamState:

@@ -1338,3 +1338,108 @@ async def test_switch_model_requires_slug(tmp_path, auth_missing):
         assert resp.status == 400
     finally:
         await shim_client.close()
+
+
+async def test_byok_responses_passthrough_forwards_without_chat_translation(tmp_path, auth_missing):
+    seen = {}
+
+    async def upstream_responses(request: web.Request):
+        seen["path"] = request.path
+        seen["headers"] = dict(request.headers)
+        seen["body"] = await request.json()
+        if seen["body"].get("stream"):
+            resp = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+            await resp.prepare(request)
+            event = {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_stream_1",
+                    "object": "response",
+                    "model": "deepseek-v4.1-flash",
+                    "status": "completed",
+                    "output": [],
+                },
+            }
+            await resp.write(f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n".encode())
+            await resp.write_eof()
+            return resp
+        return web.json_response(
+            {
+                "id": "resp_direct_1",
+                "object": "response",
+                "model": "deepseek-v4.1-flash",
+                "status": "completed",
+                "output": [
+                    {
+                        "id": "msg_1",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "native passthrough"}],
+                    }
+                ],
+            }
+        )
+
+    async def upstream_compact(request: web.Request):
+        body = await request.json()
+        return web.json_response({"id": "cmp_1", "object": "response.compacted", "model": body["model"], "output": []})
+
+    upstream_app = web.Application()
+    upstream_app.router.add_post("/v1/responses", upstream_responses)
+    upstream_app.router.add_post("/v1/responses/compact", upstream_compact)
+
+    async with TestServer(upstream_app) as upstream:
+        cfg = tmp_path / "models.json"
+        cfg.write_text(
+            json.dumps(
+                {
+                    "models": [
+                        {
+                            "slug": "ds-flash-direct",
+                            "model": "deepseek-v4.1-flash",
+                            "display_name": "DeepSeek Flash Direct",
+                            "provider": "openai",
+                            "wire_api": "responses",
+                            "base_url": f"http://127.0.0.1:{upstream.port}/v1",
+                            "api_key": "sk-direct-test",
+                            "max_output_tokens": 4096,
+                        }
+                    ]
+                }
+            )
+        )
+        shim = ShimServer(settings_path=cfg)
+        async with TestClient(TestServer(shim.app())) as client:
+            resp = await client.post(
+                "/v1/responses",
+                json={
+                    "model": "ds-flash-direct",
+                    "input": [{"type": "message", "role": "user", "content": "hello"}],
+                    "stream": False,
+                },
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert seen["path"] == "/v1/responses"
+            assert seen["body"]["model"] == "deepseek-v4.1-flash"
+            assert seen["body"]["max_output_tokens"] == 4096
+            assert "messages" not in seen["body"]
+            assert data["model"] == "ds-flash-direct"
+            assert data["output"][0]["content"][0]["text"] == "native passthrough"
+
+            sresp = await client.post(
+                "/v1/responses",
+                json={"model": "ds-flash-direct", "input": "stream me", "stream": True},
+            )
+            assert sresp.status == 200
+            raw_sse = (await sresp.read()).decode()
+            assert '"model":"ds-flash-direct"' in raw_sse
+            assert "data: [DONE]" in raw_sse
+
+            cresp = await client.post(
+                "/v1/responses/compact",
+                json={"model": "ds-flash-direct", "input": [{"type": "message", "role": "user", "content": "hi"}]},
+            )
+            assert cresp.status == 200
+            cdata = await cresp.json()
+            assert cdata["model"] == "ds-flash-direct"
